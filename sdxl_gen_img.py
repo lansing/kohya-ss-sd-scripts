@@ -1522,13 +1522,10 @@ def main(args):
                         print(f"metadata for: {network_weight}: {metadata}")
 
                 try:
-                    print("\n\n trying \n\n\n")
-                    print(net_kwargs)
                     network, weights_sd = imported_module.create_network_from_weights(
                         network_mul, network_weight, vae, [text_encoder1, text_encoder2], unet, for_inference=True, **net_kwargs
                     )
                 except AttributeError:
-                    print("\n\n\n\n except \n\n\n")
                     # hack workaround to support IA3
                     network = imported_module.create_network(
                         network_mul,
@@ -2158,7 +2155,12 @@ def main(args):
                 elif args.sequential_file_name:
                     fln = f"im_{highres_prefix}{step_first + i + 1:06d}.png"
                 else:
-                    fln = f"im_{ts_str}_{highres_prefix}{i:03d}_{seed}.png"
+                    if args.network_weights:
+                        # max hack to label files w network weights
+                        net_str = os.path.basename(args.network_weights[0])
+                        fln = f"im_{ts_str}_{net_str}_{seed}.png"
+                    else:
+                        fln = f"im_{ts_str}_{highres_prefix}{i:03d}_{seed}.png"
 
                 image.save(os.path.join(args.outdir, fln), pnginfo=metadata)
 
