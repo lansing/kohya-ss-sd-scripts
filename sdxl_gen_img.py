@@ -1521,15 +1521,36 @@ def main(args):
                     if metadata is not None:
                         print(f"metadata for: {network_weight}: {metadata}")
 
-                network, weights_sd = imported_module.create_network_from_weights(
-                    network_mul, network_weight, vae, [text_encoder1, text_encoder2], unet, for_inference=True, **net_kwargs
-                )
+                try:
+                    print("\n\n trying \n\n\n")
+                    print(net_kwargs)
+                    network, weights_sd = imported_module.create_network_from_weights(
+                        network_mul, network_weight, vae, [text_encoder1, text_encoder2], unet, for_inference=True, **net_kwargs
+                    )
+                except AttributeError:
+                    print("\n\n\n\n except \n\n\n")
+                    # hack workaround to support IA3
+                    network = imported_module.create_network(
+                        network_mul,
+                        None,  #  network_dim, not relevant for IA3
+                        None,  #  network_alpha, not relevant for IA3
+                        vae,
+                        text_encoder1,  #  TODO support multiple TEs
+                        unet,
+                        **net_kwargs
+                    )
+                    network.load_weights(network_weight)
+                    weights_sd = network.weights_sd
             else:
                 raise ValueError("No weight. Weight is required.")
             if network is None:
                 return
 
-            mergeable = network.is_mergeable()
+            try:
+                mergeable = network.is_mergeable()
+            except:
+                mergeable = False  # workaround for not supporting is_mergeable()
+
             if args.network_merge and not mergeable:
                 print("network is not mergiable. ignore merge option.")
 
