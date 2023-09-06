@@ -1532,7 +1532,8 @@ def main(args):
                         None,  #  network_dim, not relevant for IA3
                         None,  #  network_alpha, not relevant for IA3
                         vae,
-                        text_encoder1,  #  TODO support multiple TEs
+                        [text_encoder1, text_encoder2],
+                        # text_encoder1, # ORIGINAL for one TE only (Max added)
                         unet,
                         **net_kwargs
                     )

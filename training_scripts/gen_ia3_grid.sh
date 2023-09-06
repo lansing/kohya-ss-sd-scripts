@@ -20,10 +20,13 @@ export NEG_PROMPT="--n (hdr, cgi, 3d, render, sketch, cartoon, drawing, anime:1.
 
 #(blue eyes, semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime:1.4), fat, text, cropped, out of frame, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers, long neck
 
+c=`ls $BASE_DIR/*True.safetensors | wc -l`
 i=0
-for FILE in $BASE_DIR/*.safetensors; do
+for FILE in $BASE_DIR/*True.safetensors; do
   i=$((i+1))
-  echo $i $FILE;
+  echo
+  echo
+  echo $i of $c $FILE;
   accelerate launch --num_cpu_threads_per_process 1 sdxl_gen_img.py  \
       --ckpt $PRETRAINED_MODEL_NAME \
       --W 1024 --H 1024 \
@@ -31,7 +34,7 @@ for FILE in $BASE_DIR/*.safetensors; do
       --vae_slices 16 \
       --fp16 \
       --batch_size 1 \
-      --images_per_prompt 4 \
+      --images_per_prompt 16 \
       --sampler k_euler_a \
       --steps 32 \
       --seed $SEED \
