@@ -17,6 +17,16 @@ import re
 import diffusers
 import numpy as np
 import torch
+
+try:
+    import intel_extension_for_pytorch as ipex
+
+    if torch.xpu.is_available():
+        from library.ipex import ipex_init
+
+        ipex_init()
+except Exception:
+    pass
 import torchvision
 from diffusers import (
     AutoencoderKL,
@@ -37,7 +47,7 @@ from diffusers import (
 from einops import rearrange
 from tqdm import tqdm
 from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPTextConfig
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, CLIPImageProcessor
 import PIL
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
@@ -60,6 +70,8 @@ SCHEDLER_SCHEDULE = "scaled_linear"
 # その他の設定
 LATENT_CHANNELS = 4
 DOWNSAMPLING_FACTOR = 8
+
+CLIP_VISION_MODEL = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 
 # region モジュール入れ替え部
 """
@@ -320,6 +332,10 @@ class PipelineLike:
         self.scheduler = scheduler
         self.safety_checker = None
 
+        self.clip_vision_model: CLIPVisionModelWithProjection = None
+        self.clip_vision_processor: CLIPImageProcessor = None
+        self.clip_vision_strength = 0.0
+
         # Textual Inversion
         self.token_replacements_list = []
         for _ in range(len(self.text_encoders)):
@@ -451,10 +467,11 @@ class PipelineLike:
         tes_text_embs = []
         tes_uncond_embs = []
         tes_real_uncond_embs = []
-        # use last pool
+
         for tokenizer, text_encoder in zip(self.tokenizers, self.text_encoders):
             token_replacer = self.get_token_replacer(tokenizer)
 
+            # use last text_pool, because it is from text encoder 2
             text_embeddings, text_pool, uncond_embeddings, uncond_pool, _ = get_weighted_text_embeddings(
                 tokenizer,
                 text_encoder,
@@ -528,6 +545,26 @@ class PipelineLike:
         emb3 = sdxl_train_util.get_timestep_embedding(torch.FloatTensor([height, width]).unsqueeze(0), 256)
         c_vector = torch.cat([emb1, emb2, emb3], dim=1).to(self.device, dtype=text_embeddings.dtype).repeat(batch_size, 1)
         uc_vector = torch.cat([uc_emb1, emb2, emb3], dim=1).to(self.device, dtype=text_embeddings.dtype).repeat(batch_size, 1)
+
+        if reginonal_network:
+            # use last pool for conditioning
+            num_sub_prompts = len(text_pool) // batch_size
+            text_pool = text_pool[num_sub_prompts - 1 :: num_sub_prompts]  # last subprompt
+
+        if init_image is not None and self.clip_vision_model is not None:
+            print(f"encode by clip_vision_model and apply clip_vision_strength={self.clip_vision_strength}")
+            vision_input = self.clip_vision_processor(init_image, return_tensors="pt", device=self.device)
+            pixel_values = vision_input["pixel_values"].to(self.device, dtype=text_embeddings.dtype)
+
+            clip_vision_embeddings = self.clip_vision_model(pixel_values=pixel_values, output_hidden_states=True, return_dict=True)
+            clip_vision_embeddings = clip_vision_embeddings.image_embeds
+
+            if len(clip_vision_embeddings) == 1 and batch_size > 1:
+                clip_vision_embeddings = clip_vision_embeddings.repeat((batch_size, 1))
+
+            clip_vision_embeddings = clip_vision_embeddings * self.clip_vision_strength
+            assert clip_vision_embeddings.shape == text_pool.shape, f"{clip_vision_embeddings.shape} != {text_pool.shape}"
+            text_pool = clip_vision_embeddings  # replace: same as ComfyUI (?)
 
         c_vector = torch.cat([text_pool, c_vector], dim=1)
         uc_vector = torch.cat([uncond_pool, uc_vector], dim=1)
@@ -661,21 +698,28 @@ class PipelineLike:
         if self.control_nets:
             # guided_hints = original_control_net.get_guided_hints(self.control_nets, num_latent_input, batch_size, clip_guide_images)
             if self.control_net_enabled:
-                for control_net in self.control_nets:
+                for control_net, _ in self.control_nets:
                     with torch.no_grad():
                         control_net.set_cond_image(clip_guide_images)
             else:
-                for control_net in self.control_nets:
+                for control_net, _ in self.control_nets:
                     control_net.set_cond_image(None)
 
+        each_control_net_enabled = [self.control_net_enabled] * len(self.control_nets)
         for i, t in enumerate(tqdm(timesteps)):
             # expand the latents if we are doing classifier free guidance
             latent_model_input = latents.repeat((num_latent_input, 1, 1, 1))
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-            # # disable control net if ratio is set
-            # if self.control_nets and self.control_net_enabled:
-            #     pass # TODO
+            # disable control net if ratio is set
+            if self.control_nets and self.control_net_enabled:
+                for j, ((control_net, ratio), enabled) in enumerate(zip(self.control_nets, each_control_net_enabled)):
+                    if not enabled or ratio >= 1.0:
+                        continue
+                    if ratio < i / len(timesteps):
+                        print(f"ControlNet {j} is disabled (ratio={ratio} at {i} / {len(timesteps)})")
+                        control_net.set_cond_image(None)
+                        each_control_net_enabled[j] = False
 
             # predict the noise residual
             # TODO Diffusers' ControlNet
@@ -732,7 +776,7 @@ class PipelineLike:
                     return None
 
         if return_latents:
-            return (latents, False)
+            return latents
 
         latents = 1 / sdxl_model_util.VAE_SCALE_FACTOR * latents
         if vae_batch_size >= batch_size:
@@ -755,7 +799,7 @@ class PipelineLike:
         image = image.cpu().permute(0, 2, 3, 1).float().numpy()
 
         if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
         if output_type == "pil":
             # image = self.numpy_to_pil(image)
@@ -1493,12 +1537,20 @@ def main(args):
         network_default_muls = []
         network_pre_calc = args.network_pre_calc
 
+        # merge関連の引数を統合する
+        if args.network_merge:
+            network_merge = len(args.network_module)  # all networks are merged
+        elif args.network_merge_n_models:
+            network_merge = args.network_merge_n_models
+        else:
+            network_merge = 0
+        print(f"network_merge: {network_merge}")
+
         for i, network_module in enumerate(args.network_module):
             print("import network module:", network_module)
             imported_module = importlib.import_module(network_module)
 
             network_mul = 1.0 if args.network_mul is None or len(args.network_mul) <= i else args.network_mul[i]
-            network_default_muls.append(network_mul)
 
             net_kwargs = {}
             if args.network_args and i < len(args.network_args):
@@ -1509,49 +1561,50 @@ def main(args):
                     key, value = net_arg.split("=")
                     net_kwargs[key] = value
 
-            if args.network_weights and i < len(args.network_weights):
-                network_weight = args.network_weights[i]
-                print("load network weights from:", network_weight)
-
-                if model_util.is_safetensors(network_weight) and args.network_show_meta:
-                    from safetensors.torch import safe_open
-
-                    with safe_open(network_weight, framework="pt") as f:
-                        metadata = f.metadata()
-                    if metadata is not None:
-                        print(f"metadata for: {network_weight}: {metadata}")
-
-                try:
-                    network, weights_sd = imported_module.create_network_from_weights(
-                        network_mul, network_weight, vae, [text_encoder1, text_encoder2], unet, for_inference=True, **net_kwargs
-                    )
-                except AttributeError:
-                    # hack workaround to support IA3
-                    network = imported_module.create_network(
-                        network_mul,
-                        None,  #  network_dim, not relevant for IA3
-                        None,  #  network_alpha, not relevant for IA3
-                        vae,
-                        [text_encoder1, text_encoder2],
-                        unet,
-                        **net_kwargs
-                    )
-                    network.load_weights(network_weight)
-                    weights_sd = network.weights_sd
-            else:
+            if args.network_weights is None or len(args.network_weights) <= i:
                 raise ValueError("No weight. Weight is required.")
+
+            network_weight = args.network_weights[i]
+            print("load network weights from:", network_weight)
+
+            if model_util.is_safetensors(network_weight) and args.network_show_meta:
+                from safetensors.torch import safe_open
+
+                with safe_open(network_weight, framework="pt") as f:
+                    metadata = f.metadata()
+                if metadata is not None:
+                    print(f"metadata for: {network_weight}: {metadata}")
+
+            try:
+                network, weights_sd = imported_module.create_network_from_weights(
+                    network_mul, network_weight, vae, [text_encoder1, text_encoder2], unet, for_inference=True, **net_kwargs
+                )
+            except AttributeError:
+                # hack workaround to support Lycoris/IA3
+                network = imported_module.create_network(
+                    network_mul,
+                    None,  # network_dim, TODO not relevant for IA3 but fix for other nets?
+                    None,  # network_alpha, TODO not relevant for IA3 but fix for other nets?
+                    vae,
+                    [text_encoder1, text_encoder2],
+                    unet,
+                    **net_kwargs
+                )
+                network.load_weights(network_weight)
+                weights_sd = network.weights_sd
             if network is None:
                 return
 
             try:
                 mergeable = network.is_mergeable()
             except:
-                mergeable = False  # workaround for not supporting is_mergeable()
+                mergeable = False  # workaround for Lycoris not supporting is_mergeable()
 
             if args.network_merge and not mergeable:
                 print("network is not mergiable. ignore merge option.")
 
-            if not args.network_merge or not mergeable:
+            if not mergeable or i >= network_merge:
+                # not merging
                 network.apply_to([text_encoder1, text_encoder2], unet)
                 info = network.load_state_dict(weights_sd, False)  # network.load_weightsを使うようにするとよい
                 print(f"weights are loaded: {info}")
@@ -1565,6 +1618,7 @@ def main(args):
                     network.backup_weights()
 
                 networks.append(network)
+                network_default_muls.append(network_mul)
             else:
                 network.merge_to([text_encoder1, text_encoder2], unet, weights_sd, dtype, device)
 
@@ -1588,7 +1642,7 @@ def main(args):
         upscaler.to(dtype).to(device)
 
     # ControlNetの処理
-    control_nets: List[ControlNetLLLite] = []
+    control_nets: List[Tuple[ControlNetLLLite, float]] = []
     # if args.control_net_models:
     #     for i, model in enumerate(args.control_net_models):
     #         prep_type = None if not args.control_net_preps or len(args.control_net_preps) <= i else args.control_net_preps[i]
@@ -1616,12 +1670,19 @@ def main(args):
                     break
             assert mlp_dim is not None and cond_emb_dim is not None, f"invalid control net: {model_file}"
 
-            control_net = ControlNetLLLite(unet, cond_emb_dim, mlp_dim)
+            multiplier = (
+                1.0
+                if not args.control_net_multipliers or len(args.control_net_multipliers) <= i
+                else args.control_net_multipliers[i]
+            )
+            ratio = 1.0 if not args.control_net_ratios or len(args.control_net_ratios) <= i else args.control_net_ratios[i]
+
+            control_net = ControlNetLLLite(unet, cond_emb_dim, mlp_dim, multiplier=multiplier)
             control_net.apply_to()
             control_net.load_state_dict(state_dict)
             control_net.to(dtype).to(device)
             control_net.set_batch_cond_only(False, False)
-            control_nets.append(control_net)
+            control_nets.append((control_net, ratio))
 
     if args.opt_channels_last:
         print(f"set optimizing: channels last")
@@ -1765,6 +1826,19 @@ def main(args):
         init_images = load_images(args.image_path)
         assert len(init_images) > 0, f"No image / 画像がありません: {args.image_path}"
         print(f"loaded {len(init_images)} images for img2img")
+
+        # CLIP Vision
+        if args.clip_vision_strength is not None:
+            print(f"load CLIP Vision model: {CLIP_VISION_MODEL}")
+            vision_model = CLIPVisionModelWithProjection.from_pretrained(CLIP_VISION_MODEL, projection_dim=1280)
+            vision_model.to(device, dtype)
+            processor = CLIPImageProcessor.from_pretrained(CLIP_VISION_MODEL)
+
+            pipe.clip_vision_model = vision_model
+            pipe.clip_vision_processor = processor
+            pipe.clip_vision_strength = args.clip_vision_strength
+            print(f"CLIP Vision model loaded.")
+
     else:
         init_images = None
 
@@ -1778,7 +1852,7 @@ def main(args):
 
     # promptがないとき、画像のPngInfoから取得する
     if init_images is not None and len(prompt_list) == 0 and not args.interactive:
-        print("get prompts from images' meta data")
+        print("get prompts from images' metadata")
         for img in init_images:
             if "prompt" in img.text:
                 prompt = img.text["prompt"]
@@ -1821,9 +1895,18 @@ def main(args):
 
         size = None
         for i, network in enumerate(networks):
-            if i < 3:
+            if (i < 3 and args.network_regional_mask_max_color_codes is None) or i < args.network_regional_mask_max_color_codes:
                 np_mask = np.array(mask_images[0])
-                np_mask = np_mask[:, :, i]
+
+                if args.network_regional_mask_max_color_codes:
+                    # カラーコードでマスクを指定する
+                    ch0 = (i + 1) & 1
+                    ch1 = ((i + 1) >> 1) & 1
+                    ch2 = ((i + 1) >> 2) & 1
+                    np_mask = np.all(np_mask == np.array([ch0, ch1, ch2]) * 255, axis=2)
+                    np_mask = np_mask.astype(np.uint8) * 255
+                else:
+                    np_mask = np_mask[:, :, i]
                 size = np_mask.shape
             else:
                 np_mask = np.full(size, 255, dtype=np.uint8)
@@ -2574,12 +2657,21 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--network_mul", type=float, default=None, nargs="*", help="additional network multiplier / 追加ネットワークの効果の倍率")
     parser.add_argument(
-        "--network_args", type=str, default=None, nargs="*", help="additional argmuments for network (key=value) / ネットワークへの追加の引数"
+        "--network_args", type=str, default=None, nargs="*", help="additional arguments for network (key=value) / ネットワークへの追加の引数"
     )
     parser.add_argument("--network_show_meta", action="store_true", help="show metadata of network model / ネットワークモデルのメタデータを表示する")
+    parser.add_argument(
+        "--network_merge_n_models", type=int, default=None, help="merge this number of networks / この数だけネットワークをマージする"
+    )
     parser.add_argument("--network_merge", action="store_true", help="merge network weights to original model / ネットワークの重みをマージする")
     parser.add_argument(
         "--network_pre_calc", action="store_true", help="pre-calculate network for generation / ネットワークのあらかじめ計算して生成する"
+    )
+    parser.add_argument(
+        "--network_regional_mask_max_color_codes",
+        type=int,
+        default=None,
+        help="max color codes for regional mask (default is None, mask by channel) / regional maskの最大色数（デフォルトはNoneでチャンネルごとのマスク）",
     )
     parser.add_argument(
         "--textual_inversion_embeddings",
@@ -2593,7 +2685,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--max_embeddings_multiples",
         type=int,
         default=None,
-        help="max embeding multiples, max token length is 75 * multiples / トークン長をデフォルトの何倍とするか 75*この値 がトークン長となる",
+        help="max embedding multiples, max token length is 75 * multiples / トークン長をデフォルトの何倍とするか 75*この値 がトークン長となる",
     )
     parser.add_argument(
         "--guide_image_path", type=str, default=None, nargs="*", help="image to CLIP guidance / CLIP guided SDでガイドに使う画像"
@@ -2628,7 +2720,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--highres_fix_upscaler_args",
         type=str,
         default=None,
-        help="additional argmuments for upscaler (key=value) / upscalerへの追加の引数",
+        help="additional arguments for upscaler (key=value) / upscalerへの追加の引数",
     )
     parser.add_argument(
         "--highres_fix_disable_control_net",
@@ -2649,14 +2741,22 @@ def setup_parser() -> argparse.ArgumentParser:
     # parser.add_argument(
     #     "--control_net_preps", type=str, default=None, nargs="*", help="ControlNet preprocess to use / 使用するControlNetのプリプロセス名"
     # )
-    # parser.add_argument("--control_net_multiplier", type=float, default=None, nargs="*", help="ControlNet multiplier / ControlNetの適用率")
-    # parser.add_argument(
-    #     "--control_net_ratios",
-    #     type=float,
-    #     default=None,
-    #     nargs="*",
-    #     help="ControlNet guidance ratio for steps / ControlNetでガイドするステップ比率",
-    # )
+    parser.add_argument(
+        "--control_net_multipliers", type=float, default=None, nargs="*", help="ControlNet multiplier / ControlNetの適用率"
+    )
+    parser.add_argument(
+        "--control_net_ratios",
+        type=float,
+        default=None,
+        nargs="*",
+        help="ControlNet guidance ratio for steps / ControlNetでガイドするステップ比率",
+    )
+    parser.add_argument(
+        "--clip_vision_strength",
+        type=float,
+        default=None,
+        help="enable CLIP Vision Conditioning for img2img with this strength / img2imgでCLIP Vision Conditioningを有効にしてこのstrengthで処理する",
+    )
     # # parser.add_argument(
     #     "--control_net_image_path", type=str, default=None, nargs="*", help="image for ControlNet guidance / ControlNetでガイドに使う画像"
     # )
